@@ -3,520 +3,567 @@ import time
 import asyncio
 import subprocess
 import json
-import requests
 import re
 import shutil
-from pyrogram import Client, filters
+import urllib.parse
+import html
+from pyrogram import Client, filters, enums
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from pyrogram.errors import FloodWait, MessageNotModified
+from pyrogram.errors import FloodWait
 from deep_translator import GoogleTranslator
 import yt_dlp
 
+# --- IMPORTANTE: PLAYWRIGHT ---
+from playwright.async_api import async_playwright
+
 # --- TUS DATOS ---
-API_ID = 33226415
+API_ID = 33226415                  
 API_HASH = "01999dae3e5348c7ab0dbcc6f7f4edc5"
 BOT_TOKEN = "8584312169:AAHQjPutXzS6sCPQ-NxIKp_5GsmjmvI9TEw"
 
-# Configuración
-COOKIES_FILE = 'cookies.txt'
-LIMIT_2GB = 2147483648
+# --- COOKIES ---
+COOKIE_MAP = {
+    'tiktok': 'cookies_tiktok.txt',
+    'facebook': 'cookies_facebook.txt',
+    'pornhub': 'cookies_pornhub.txt',
+    'x.com': 'cookies_x.txt',
+    'twitter': 'cookies_x.txt',
+    'xvideos': 'cookies_xvideos.txt',
+}
 
-# Dependencias
+DB_FILE = 'descargas.json'
+LIMIT_2GB = 2000 * 1024 * 1024 
+
 HAS_ARIA2 = shutil.which("aria2c") is not None
 HAS_FFMPEG = shutil.which("ffmpeg") is not None
 
-# Almacenamiento
 url_storage = {}
 user_config = {} 
+downloads_db = {}
 
-print("🚀 Iniciando Bot Pro (Fixed: Menú Auto)...")
+print("🚀 Iniciando Bot Pro (Playwright Sniffer Reforzado + Fix)...")
 
-app = Client(
-    "mi_bot_pro", 
-    api_id=API_ID, 
-    api_hash=API_HASH, 
-    bot_token=BOT_TOKEN,
-    workers=16,
-    max_concurrent_transmissions=8
-)
+# --- CACHE DB ---
+def cargar_db():
+    global downloads_db
+    if os.path.exists(DB_FILE):
+        try:
+            with open(DB_FILE, 'r') as f: downloads_db = json.load(f)
+        except: downloads_db = {}
 
-# --- 1. FUNCIONES HELPER ---
+def guardar_db():
+    try:
+        with open(DB_FILE, 'w') as f: json.dump(downloads_db, f, indent=4)
+    except: pass
+
+cargar_db()
+
+app = Client("mi_bot_pro", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, workers=16)
+
+# --- 1. CONFIGURACIÓN ---
 
 def get_config(chat_id):
     if chat_id not in user_config:
         user_config[chat_id] = {
             'lang': 'orig', 'fmt': 'mp4',
-            'q_fixed': None, 'q_auto': None, 'meta': True
+            'q_fixed': None, 'q_auto': None, 'meta': True,
+            'html_mode': True 
         }
     return user_config[chat_id]
 
 def format_bytes(size):
-    if not size: return ""
+    if not size or size <= 0: return "N/A"
     power = 2**10
     n = 0
-    power_labels = {0 : '', 1: 'K', 2: 'M', 3: 'G', 4: 'T'}
-    while size > power:
+    power_labels = {0 : 'B', 1: 'KB', 2: 'MB', 3: 'GB'}
+    while size > power and n < 3:
         size /= power
         n += 1
-    return f" (~{size:.1f} {power_labels[n]}B)"
+    return f"{size:.1f} {power_labels[n]}"
 
-def limpiar_enlace_youtube(url):
+# =========================================================================
+# 🕵️ SNIFFER AVANZADO CON PLAYWRIGHT (MEJORADO: CLICKS REALES)
+# =========================================================================
+
+async def detectar_video_real(url):
+    """
+    Navegador real headless. Simula clicks para activar la carga de video.
+    """
+    print(f"🕵️ Playwright Sniffer iniciando en: {url}")
+    detected_videos = []
+    seen_urls = set()
+
+    async with async_playwright() as p:
+        # Argumentos para parecer un navegador real y evitar bloqueos básicos
+        browser = await p.chromium.launch(
+            headless=True, 
+            args=[
+                '--no-sandbox', 
+                '--disable-setuid-sandbox', 
+                '--disable-gpu',
+                '--disable-blink-features=AutomationControlled' # Importante para evitar detección
+            ]
+        )
+        
+        # Usar User-Agent de móvil ayuda a que sirvan MP4 directo en vez de streams raros
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36",
+            viewport={'width': 390, 'height': 844},
+            locale='es-ES'
+        )
+        page = await context.new_page()
+
+        # --- LISTENER DE TRÁFICO ---
+        async def handle_response(response):
+            try:
+                r_url = response.url
+                # Filtramos extensiones de video y listas de reproducción
+                if any(ext in r_url.lower() for ext in ['.mp4', '.m3u8', '.mov', '.webm', 'master.json', 'manifest']):
+                    if r_url in seen_urls: return
+                    # Ignorar imágenes o previsualizaciones
+                    if any(x in r_url for x in ['favicon', 'preview', 'thumb', 'poster', 'sprite', '.jpg', '.png']): return
+                    
+                    seen_urls.add(r_url)
+                    
+                    size = 0
+                    try:
+                        headers = await response.all_headers()
+                        if 'content-length' in headers:
+                            size = int(headers['content-length'])
+                    except: pass
+
+                    res_type = "Video"
+                    if ".m3u8" in r_url or "manifest" in r_url: res_type = "Stream (HLS)"
+                    elif "1080" in r_url: res_type = "1080p?"
+                    elif "720" in r_url: res_type = "720p?"
+
+                    detected_videos.append({
+                        'url': r_url,
+                        'size': size,
+                        'res': res_type
+                    })
+            except: pass
+
+        page.on("response", handle_response)
+
+        try:
+            # Ir a la página
+            await page.goto(url, wait_until="domcontentloaded", timeout=40000)
+            await asyncio.sleep(3) 
+
+            # --- ESTRATEGIA DE "PLAY" FORZADO (TIPO EXTENSION DE CHROME) ---
+            
+            # 1. Buscar iframes (muchos videos están dentro de uno)
+            frames = page.frames
+            all_pages = [page] + frames
+
+            for frame in all_pages:
+                try:
+                    # Intentar buscar botones gigantes de play y clickearlos
+                    await frame.evaluate("""() => {
+                        // Buscar botones comunes de video players
+                        const buttons = document.querySelectorAll('button, .vjs-big-play-button, .ytp-large-play-button, [class*="play"]');
+                        buttons.forEach(b => b.click());
+                        
+                        // Buscar video tags y forzar play
+                        const vids = document.querySelectorAll('video');
+                        vids.forEach(v => {
+                            v.muted = true;
+                            v.play().catch(e => console.log(e));
+                        });
+                    }""")
+                except: pass
+            
+            # 2. Clic en el centro de la pantalla (overlay genérico)
+            try:
+                viewport = page.viewport_size
+                if viewport:
+                    await page.mouse.click(viewport['width'] / 2, viewport['height'] / 2)
+            except: pass
+            
+            # Esperar tráfico tras los clics
+            await asyncio.sleep(6)
+
+            # --- REVISIÓN FINAL DEL HTML ---
+            content = await page.content()
+            regex_video = r'(https?://[^\s"\'<>]+?\.(?:mp4|m3u8)[^\s"\'<>]*)'
+            for match in re.findall(regex_video, content):
+                clean = match.replace('\\/', '/')
+                if clean not in seen_urls and not any(x in clean for x in ['.jpg', '.png', 'thumb']):
+                    seen_urls.add(clean)
+                    detected_videos.append({'url': clean, 'size': 0, 'res': 'Link HTML'})
+
+        except Exception as e:
+            print(f"⚠️ Playwright Warning: {e}")
+        finally:
+            await browser.close()
+
+    return sorted(detected_videos, key=lambda x: (0 if 'mp4' in x['url'] else 1, -x['size']))
+
+# =========================================================================
+
+# --- UTILS ---
+
+def limpiar_url(url):
     if "youtube.com" in url or "youtu.be" in url:
-        patron = r'(?:v=|\/|shorts\/)([0-9A-Za-z_-]{11})'
-        match = re.search(patron, url)
+        match = re.search(r'(?:v=|\/|shorts\/)([0-9A-Za-z_-]{11})', url)
         if match: return f"https://www.youtube.com/watch?v={match.group(1)}"
-    return url
+    if "eporner" in url:
+        url = re.sub(r'https?://(es|de|fr|it)\.eporner\.com', 'https://www.eporner.com', url)
+    return url.split("?")[0]
 
-async def resolver_url_redirect(url):
-    try:
-        return requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, allow_redirects=True, timeout=10).url
-    except: return url
+def sel_cookie(url):
+    for k, v in COOKIE_MAP.items():
+        if k in url and os.path.exists(v): return v
+    return None
 
 async def traducir_texto(texto):
-    if not texto or len(texto) < 2: return texto
+    if not texto: return ""
     try:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, lambda: GoogleTranslator(source='auto', target='es').translate(texto))
     except: return texto
 
-# --- 2. FUNCIONES FFMPEG ---
+# --- FFMPEG & PROGRESO ---
 
-async def generar_thumbnail(ruta_video, chat_id, timestamp):
-    if not HAS_FFMPEG: return None
-    thumb_path = f"thumb_{chat_id}_{timestamp}.jpg"
-    try:
-        cmd = ["ffmpeg", "-i", ruta_video, "-ss", "00:00:02", "-vframes", "1", thumb_path, "-y"]
-        process = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        await process.wait()
-        if os.path.exists(thumb_path): return thumb_path
-    except: pass
+async def get_thumb(path, cid, ts):
+    out = f"t_{cid}_{ts}.jpg"
+    if HAS_FFMPEG:
+        try:
+            await (await asyncio.create_subprocess_exec("ffmpeg", "-i", path, "-ss", "00:00:02", "-vframes", "1", out, "-y", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)).wait()
+            if os.path.exists(out): return out
+        except: pass
     return None
 
-async def obtener_metadatos_video(ruta_archivo):
-    if not HAS_FFMPEG: return 0, 0, 0
+async def get_meta(path):
+    if not HAS_FFMPEG: return 0,0,0
     try:
-        cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height,duration", "-of", "json", ruta_archivo]
-        raw = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        stdout, _ = await raw.communicate()
-        data = json.loads(stdout.decode('utf-8'))
-        s = data['streams'][0]
-        return int(s.get('width', 0)), int(s.get('height', 0)), int(float(s.get('duration', 0)))
-    except: return 0, 0, 0
+        p = await asyncio.create_subprocess_exec("ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height,duration", "-of", "json", path, stdout=subprocess.PIPE)
+        d = json.loads((await p.communicate())[0])
+        s = d['streams'][0]
+        return int(s.get('width',0)), int(s.get('height',0)), int(float(s.get('duration',0)))
+    except: return 0,0,0
 
-async def obtener_duracion_audio(ruta_archivo):
-    if not HAS_FFMPEG: return 0
+async def get_audio_dur(path):
     try:
-        cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", ruta_archivo]
-        raw = await asyncio.create_subprocess_exec(*cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        stdout, _ = await raw.communicate()
-        data = json.loads(stdout.decode('utf-8'))
-        return int(float(data['format']['duration']))
+        p = await asyncio.create_subprocess_exec("ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", path, stdout=subprocess.PIPE)
+        return int(float(json.loads((await p.communicate())[0])['format']['duration']))
     except: return 0
 
-# --- 3. GESTIÓN DE MENSAJES INTELIGENTE ---
-
-async def safe_edit(message, text):
-    try:
-        await message.edit_text(text)
-        return message
-    except FloodWait as e:
-        await asyncio.sleep(e.value)
-        try: await message.edit_text(text)
-        except: pass
-    except MessageNotModified: pass
-    except Exception: pass
-    return message
-
-async def clean_and_send(client, chat_id, text, old_msg_to_delete=None):
-    if old_msg_to_delete:
-        try: await old_msg_to_delete.delete()
-        except: pass
-    try:
-        return await client.send_message(chat_id, text)
-    except FloodWait as e:
-        await asyncio.sleep(e.value)
-        return await client.send_message(chat_id, text)
-
-# --- 4. PROGRESO ---
-
-async def progreso(current, total, message, times_info):
+async def progreso(cur, tot, msg, times, act):
     now = time.time()
-    start_time, last_update = times_info
-    if (now - last_update) > 5 or current == total:
-        times_info[1] = now
+    if (now - times[1]) > 4 or cur == tot:
+        times[1] = now
         try:
-            porc = current * 100 / total
-            mb_curr = current / (1024*1024)
-            mb_total = total / (1024*1024)
-            speed = mb_curr / (now - start_time) if (now - start_time) > 0 else 0
-            text = f"📤 **Subiendo...**\n📊 {porc:.1f}% | 📦 {mb_curr:.1f}/{mb_total:.1f} MB\n🚀 {speed:.2f} MB/s"
-            await message.edit_text(text)
-        except FloodWait: pass 
+            await msg._client.send_chat_action(msg.chat.id, act)
+            per = cur * 100 / tot
+            txt = f"📤 **Subiendo...**\n📊 {per:.1f}% | 📦 {cur/1048576:.1f}/{tot/1048576:.1f} MB"
+            await msg.edit_text(txt)
         except: pass
 
-# --- 5. PROCESO DE DESCARGA ---
+# --- PROCESO DE DESCARGA (CORREGIDO) ---
 
-async def procesar_descarga_video(client, chat_id, url, calidad, datos_info, origin_message):
+async def procesar_descarga(client, chat_id, url, calidad, datos, msg_orig):
     conf = get_config(chat_id)
-    timestamp = int(time.time())
+    vid_id = datos.get('id')
     
-    tipo_txt = "Audio" if calidad == "mp3" else f"Video"
-    msg_status = await clean_and_send(
-        client, chat_id, 
-        f"⏳ **Descargando...**\n📥 {tipo_txt} | 🚀 Motor: {'Aria2' if HAS_ARIA2 else 'Nativo'}", 
-        old_msg_to_delete=origin_message
-    )
-    
-    opciones = {
-        'quiet': True, 'max_filesize': LIMIT_2GB, 'no_warnings': True, 
-        'noplaylist': True, 'outtmpl': f"dl_{chat_id}_{timestamp}.%(ext)s"
-    }
-    
-    if HAS_ARIA2:
-        opciones['external_downloader'] = 'aria2c'
-        opciones['external_downloader_args'] = ['-x', '16', '-s', '16', '-k', '1M']
-    if os.path.exists(COOKIES_FILE): opciones['cookiefile'] = COOKIES_FILE
+    # --- CORRECCIÓN VARIABLES ---
+    # Definimos esto AL PRINCIPIO para evitar 'UnboundLocalError' en el finally
+    final = None
+    thumb = None
+    ts = int(time.time())
+    status = None
+    # ----------------------------
 
-    archivo_final = None
-    thumb_path = None
+    url_descarga = url
+    if calidad.startswith("html_"):
+        idx = int(calidad.split("_")[1])
+        if 'html_links_data' in datos and len(datos['html_links_data']) > idx:
+            url_descarga = datos['html_links_data'][idx]['url']
+            ckey = f"html_{idx}" 
+        else:
+            await client.send_message(chat_id, "❌ Enlace expirado.")
+            return
+    else:
+        ckey = "mp3" if calidad == "mp3" else calidad
+    
+    # Revisar Cache
+    if vid_id and vid_id in downloads_db and ckey in downloads_db[vid_id]:
+        try:
+            fid = downloads_db[vid_id][ckey]
+            cap = f"🎬 **{datos.get('titulo','Video')}**\n✨ (Cache)"
+            if calidad == "mp3": await client.send_audio(chat_id, fid, caption=cap)
+            else: await client.send_video(chat_id, fid, caption=cap)
+            return
+        except: pass
 
     try:
-        loop = asyncio.get_running_loop()
+        status = await client.send_message(chat_id, f"⏳ **Procesando...**\n📥 {calidad}")
+        
+        opts = {
+            'outtmpl': f"dl_{chat_id}_{ts}.%(ext)s",
+            'quiet': True, 'no_warnings': True, 'max_filesize': LIMIT_2GB,
+            'http_headers': {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        }
+
         if calidad == "mp3":
-            archivo_base = f"a_{chat_id}_{timestamp}"
-            opciones.update({
-                'format': 'bestaudio/best',
-                'outtmpl': f"{archivo_base}.%(ext)s",
-                'postprocessors': [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3','preferredquality': '192'}]
-            })
-            with yt_dlp.YoutubeDL(opciones) as ydl:
-                await loop.run_in_executor(None, lambda: ydl.download([url]))
-            archivo_final = f"{archivo_base}.mp3"
+            opts.update({'format': 'bestaudio/best', 'postprocessors': [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3'}]})
+        elif calidad.startswith("html_"):
+            opts['format'] = 'best'
         else:
-            archivo_final = f"v_{chat_id}_{timestamp}.mp4"
-            fmt_str = 'bestvideo+bestaudio/best' if calidad == 'best' else \
-                      'worstvideo+bestaudio/worst' if calidad == 'worst' else \
-                      f'bestvideo[height<={calidad}]+bestaudio/best[height<={calidad}]/best'
-            opciones.update({
-                'format': fmt_str, 'outtmpl': archivo_final, 
-                'merge_output_format': 'mp4',
-                'postprocessor_args': {'ffmpeg': ['-movflags', '+faststart']}
-            })
-            with yt_dlp.YoutubeDL(opciones) as ydl:
-                await loop.run_in_executor(None, lambda: ydl.download([url]))
-
-        if not os.path.exists(archivo_final):
-            await safe_edit(msg_status, "❌ Error: Falló la descarga.")
-            return
-
-        if os.path.getsize(archivo_final) > LIMIT_2GB:
-            os.remove(archivo_final)
-            await safe_edit(msg_status, "❌ Archivo > 2GB.")
-            return
-
-        await safe_edit(msg_status, "📝 **Procesando metadatos...**")
-
-        width, height, duration = 0, 0, 0
-        if calidad != "mp3":
-            thumb_path = await generar_thumbnail(archivo_final, chat_id, timestamp)
-            width, height, duration = await obtener_metadatos_video(archivo_final)
-        else:
-            duration = await obtener_duracion_audio(archivo_final)
-
-        caption = ""
-        if conf['meta']:
-            tit = datos_info.get('titulo', 'Media')
-            desc = datos_info.get('descripcion', '')
-            all_tags = (datos_info.get('tags') or []) + (datos_info.get('categories') or [])
-            if datos_info.get('genre'): all_tags.append(datos_info.get('genre'))
-            clean_tags = []
-            seen = set()
-            for t in all_tags:
-                if t and t not in seen:
-                    seen.add(t)
-                    clean_tags.append(f"#{str(t).strip().replace(' ', '_').replace('-', '_')}")
-            
-            if conf['lang'] == 'es':
-                tit = await traducir_texto(tit)
-                desc = await traducir_texto(desc[:800]) if desc else ""
+            # Aquí usamos el format ID si viene del botón de YT-DLP, o 'best'
+            if calidad.isdigit() or "x" in calidad: # Si es resolución o ID
+                 opts['format'] = f"bv*[height<={calidad.split('x')[-1]}]+ba/b[height<={calidad.split('x')[-1]}] / best"
             else:
-                desc = (desc[:800] + "...") if desc else ""
-            caption = f"🎬 **{tit}**\n\n📝 {desc}\n\n{' '.join(clean_tags[:15])}"[:1024]
+                 opts['format'] = 'best'
+            opts['merge_output_format'] = 'mp4'
 
-        try: await msg_status.edit_text("📤 **Subiendo...**")
-        except: 
-            await msg_status.delete()
-            msg_status = await client.send_message(chat_id, "📤 **Subiendo...**")
-
-        times_info = [time.time(), 0]
-        
-        if calidad == "mp3":
-            await client.send_audio(chat_id, audio=archivo_final, caption=caption,
-                title=datos_info.get('titulo') if conf['meta'] else None,
-                duration=duration, progress=progreso, progress_args=(msg_status, times_info))
+        if "eporner" in url_descarga: opts.update({'external_downloader': None, 'nocheckcertificate': True})
+        elif "pornhub" in url_descarga: opts.update({'cookiefile': 'cookies_pornhub.txt', 'nocheckcertificate': True})
         else:
-            await client.send_video(chat_id, video=archivo_final, caption=caption,
-                width=width, height=height, duration=duration, thumb=thumb_path,
-                supports_streaming=True, progress=progreso, progress_args=(msg_status, times_info))
+            c = sel_cookie(url_descarga)
+            if c: opts['cookiefile'] = c
+            if HAS_ARIA2 and not calidad.startswith("html_"): 
+                opts.update({'external_downloader': 'aria2c', 'external_downloader_args': ['-x','16','-k','1M']})
+
+        loop = asyncio.get_running_loop()
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            await loop.run_in_executor(None, lambda: ydl.download([url_descarga]))
         
-        await msg_status.delete()
+        base = f"dl_{chat_id}_{ts}"
+        if calidad == "mp3": final = f"{base}.mp3"
+        else:
+            for e in ['.mp4','.mkv','.webm']:
+                if os.path.exists(base+e): 
+                    final = base+e
+                    break
+        
+        if not final or not os.path.exists(final):
+            if status: await status.edit("❌ Fallo en descarga. El enlace puede estar protegido.")
+            return
+        
+        if os.path.getsize(final) > LIMIT_2GB:
+            os.remove(final)
+            if status: await status.edit("❌ Archivo > 2GB.")
+            return
+
+        if status: await status.edit("📝 **Obteniendo Metadatos...**")
+        
+        w, h, dur = 0, 0, 0
+        
+        if calidad != "mp3":
+            thumb = await get_thumb(final, chat_id, ts)
+            w, h, dur = await get_meta(final)
+        else:
+            dur = await get_audio_dur(final)
+
+        cap = ""
+        if conf['meta']:
+            t = datos.get('titulo','Video')
+            if conf['lang'] == 'es': t = await traducir_texto(t)
+            tags = [f"#{x.replace(' ','_')}" for x in (datos.get('tags') or [])[:10]]
+            res_str = f"{w}x{h}" if w else "Audio"
+            cap = f"🎬 **{t}**\n⚙️ {res_str} | ⏱ {time.strftime('%H:%M:%S', time.gmtime(dur))}\n{' '.join(tags)}"[:1024]
+
+        if status: await status.edit("📤 **Subiendo...**")
+        act = enums.ChatAction.UPLOAD_AUDIO if calidad == "mp3" else enums.ChatAction.UPLOAD_VIDEO
+        
+        res = None
+        if calidad == "mp3":
+            res = await client.send_audio(chat_id, final, caption=cap, duration=dur, thumb=thumb, progress=progreso, progress_args=(status, [time.time(),0], act))
+        else:
+            res = await client.send_video(chat_id, final, caption=cap, width=w, height=h, duration=dur, thumb=thumb, progress=progreso, progress_args=(status, [time.time(),0], act))
+
+        if res and vid_id and not calidad.startswith("html_"):
+            if vid_id not in downloads_db: downloads_db[vid_id] = {}
+            downloads_db[vid_id][ckey] = (res.audio or res.video).file_id
+            guardar_db()
 
     except Exception as e:
-        print(f"Error: {e}")
-        await clean_and_send(client, chat_id, f"❌ Error: {str(e)[:50]}", msg_status)
+        if status: await status.edit(f"❌ Error: {e}")
     finally:
-        if archivo_final and os.path.exists(archivo_final): 
-            try: os.remove(archivo_final)
+        # Limpieza segura
+        for f in [final, thumb, f"dl_{chat_id}_{ts}.jpg"]:
+            if f and os.path.exists(f):
+                try: os.remove(f)
+                except: pass
+        if status:
+            try: await status.delete()
             except: pass
-        if thumb_path and os.path.exists(thumb_path): 
-            try: os.remove(thumb_path)
-            except: pass
 
-# --- 6. CALLBACKS CORREGIDOS ---
+# --- MENÚS ---
 
-@app.on_callback_query()
-async def boton_callback(client, callback_query):
-    data = callback_query.data
-    msg = callback_query.message
-    chat_id = msg.chat.id
-    conf = get_config(chat_id)
-
-    try:
-        if data == "cancel":
-            await msg.delete()
-            return
-
-        if data.startswith("dl|"):
-            parts = data.split("|")
-            calidad = parts[1]
-            datos = url_storage.get(chat_id)
-            if not datos:
-                await callback_query.answer("⚠️ Enlace expirado.", show_alert=True)
-                return
-            await procesar_descarga_video(client, chat_id, datos['url'], calidad, datos, origin_message=msg)
-            return
-
-        new_kb = None
-        new_txt = None
-        
-        if data == "menu|main":
-            new_txt = "⚙️ **Panel Principal**"
-            new_kb = generar_teclado_start(conf)
-        elif data == "toggle|fmt":
-            conf['fmt'] = 'mp3' if conf['fmt'] == 'mp4' else 'mp4'
-            new_kb = generar_teclado_start(conf)
-        elif data == "toggle|lang":
-            conf['lang'] = 'es' if conf['lang'] == 'orig' else 'orig'
-            new_kb = generar_teclado_start(conf)
-        elif data == "toggle|meta":
-            conf['meta'] = not conf['meta']
-            new_kb = generar_teclado_start(conf)
-        
-        # --- MENÚ CALIDAD FIJA ---
-        elif data == "menu|fixed":
-            btns = []
-            for q in ['1080', '720', '480', '360']:
-                mark = "✅" if conf['q_fixed'] == q else ""
-                btns.append(InlineKeyboardButton(f"{mark} {q}p", callback_data=f"set_q|{q}"))
-            kb_l = [btns[i:i+2] for i in range(0, len(btns), 2)]
-            kb_l.append([InlineKeyboardButton("❌ Off", callback_data="set_q|off"), InlineKeyboardButton("🔙", callback_data="menu|main")])
-            new_txt = "🎯 **Calidad Fija**"
-            new_kb = InlineKeyboardMarkup(kb_l)
-        
-        # --- MENÚ AUTO (CORREGIDO) ---
-        elif data == "menu|auto":
-            botones = [
-                [InlineKeyboardButton("🌟 Max Calidad (Best)", callback_data="set_auto|max")],
-                [InlineKeyboardButton("📉 Min Calidad (Worst)", callback_data="set_auto|min")],
-                [InlineKeyboardButton("❌ Desactivar Auto", callback_data="set_auto|off")],
-                [InlineKeyboardButton("🔙 Volver", callback_data="menu|main")]
-            ]
-            new_txt = "🤖 **Modo Automático**\nElige prioridad:"
-            new_kb = InlineKeyboardMarkup(botones)
-
-        # --- SETTERS ---
-        elif data.startswith("set_q|"):
-            val = data.split("|")[1]
-            conf['q_fixed'] = None if val == "off" else val
-            if val != "off": conf['q_auto'] = None
-            new_txt = f"✅ Calidad Fija: {val}p" if val != "off" else "✅ Calidad Fija: OFF"
-            new_kb = generar_teclado_start(conf)
-
-        elif data.startswith("set_auto|"):
-            val = data.split("|")[1]
-            conf['q_auto'] = None if val == "off" else val
-            if val != "off": conf['q_fixed'] = None
-            new_txt = f"✅ Modo Auto: {val.upper()}" if val != "off" else "✅ Modo Auto: OFF"
-            new_kb = generar_teclado_start(conf)
-
-        # Aplicar cambios visuales
-        if new_kb:
-            try:
-                if new_txt: await msg.edit_text(new_txt, reply_markup=new_kb)
-                else: await msg.edit_reply_markup(new_kb)
-            except FloodWait as e:
-                await callback_query.answer(f"⏳ Espera {e.value}s", show_alert=True)
-
-    except Exception as e:
-        print(f"Error Callback: {e}")
-
-def generar_teclado_start(conf):
-    chk = "✅"
-    s_auto = f"{chk} Auto ({conf['q_auto'].upper()})" if conf['q_auto'] else "Auto"
-    s_fix = f"{chk} {conf['q_fixed']}p" if conf['q_fixed'] else "Fija"
-
+def gen_kb(conf):
+    c_html = "🟢" if conf['html_mode'] else "🔴"
+    c_meta = "🟢" if conf['meta'] else "🔴"
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(s_fix, callback_data="menu|fixed"),
-         InlineKeyboardButton(s_auto, callback_data="menu|auto")],
-        [InlineKeyboardButton(f"📝 Info: {'ON' if conf['meta'] else 'OFF'}", callback_data="toggle|meta")],
-        [InlineKeyboardButton(f"Fmt: {conf['fmt'].upper()}", callback_data="toggle|fmt"), 
-         InlineKeyboardButton(f"Lang: {conf['lang'].upper()}", callback_data="toggle|lang")]
+        [InlineKeyboardButton(f"🕵️ Sniffer (HTML): {c_html}", callback_data="toggle|html")],
+        [InlineKeyboardButton(f"📝 Metadatos: {c_meta}", callback_data="toggle|meta")],
+        [InlineKeyboardButton(f"⚙️ Auto: {conf['q_auto'] or 'Off'}", callback_data="menu|auto"),
+         InlineKeyboardButton(f"📌 Fija: {conf['q_fixed'] or 'Off'}p", callback_data="menu|fixed")],
+        [InlineKeyboardButton(f"🌎 Lang: {conf['lang'].upper()}", callback_data="toggle|lang"),
+         InlineKeyboardButton(f"🎵 Fmt: {conf['fmt'].upper()}", callback_data="toggle|fmt")]
     ])
 
-@app.on_message(filters.command("start"))
-async def start(client, message):
-    await message.reply_text("⚙️ **Bot Config**", reply_markup=generar_teclado_start(get_config(message.chat.id)))
+@app.on_callback_query()
+async def cb(c, q):
+    data = q.data
+    msg = q.message
+    cid = msg.chat.id
+    conf = get_config(cid)
 
-# --- 7. ANALIZADOR ---
+    if data == "cancel": 
+        await msg.delete()
+        return
+
+    if data.startswith("dl|"):
+        d_storage = url_storage.get(cid)
+        if not d_storage: return await q.answer("⚠️ Expirado", show_alert=True)
+        
+        url_target = d_storage['url']
+        await msg.delete()
+        # Pasamos el control a la descarga
+        await procesar_descarga(c, cid, url_target, data.split("|")[1], d_storage, msg)
+        return
+
+    if data == "toggle|html": conf['html_mode'] = not conf['html_mode']
+    elif data == "toggle|meta": conf['meta'] = not conf['meta']
+    elif data == "toggle|lang": conf['lang'] = 'es' if conf['lang'] == 'orig' else 'orig'
+    elif data == "toggle|fmt": conf['fmt'] = 'mp3' if conf['fmt'] == 'mp4' else 'mp4'
+    
+    elif data == "menu|auto":
+        return await msg.edit_text("🤖 **Auto**", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("Best", callback_data="set_auto|max")],
+            [InlineKeyboardButton("Worst", callback_data="set_auto|min")],
+            [InlineKeyboardButton("Off", callback_data="set_auto|off")],
+            [InlineKeyboardButton("Back", callback_data="menu|main")]
+        ]))
+    
+    elif data == "menu|fixed":
+        return await msg.edit_text("📌 **Fixed**", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("1080p", callback_data="set_q|1080"), InlineKeyboardButton("720p", callback_data="set_q|720")],
+            [InlineKeyboardButton("480p", callback_data="set_q|480"), InlineKeyboardButton("360p", callback_data="set_q|360")],
+            [InlineKeyboardButton("Off", callback_data="set_q|off"), InlineKeyboardButton("Back", callback_data="menu|main")]
+        ]))
+
+    elif "set_auto" in data:
+        v = data.split("|")[1]
+        conf['q_auto'] = None if v == "off" else v
+        if v != "off": conf['q_fixed'] = None
+    
+    elif "set_q" in data:
+        v = data.split("|")[1]
+        conf['q_fixed'] = None if v == "off" else v
+        if v != "off": conf['q_auto'] = None
+
+    elif data == "menu|main": pass
+
+    await msg.edit_text("⚙️ **Panel**", reply_markup=gen_kb(conf))
+
+@app.on_message(filters.command("start"))
+async def start(c, m):
+    await m.reply_text("⚙️ **Configuración Bot Pro**", reply_markup=gen_kb(get_config(m.chat.id)))
+
+# --- ANALIZADOR PRINCIPAL (ACTUALIZADO DIMENSIONES) ---
 
 @app.on_message(filters.text & (filters.regex("http") | filters.regex("www")))
-async def analizar_enlace(client, message):
-    chat_id = message.chat.id
-    url = message.text.strip()
+async def analyze(c, m):
+    cid = m.chat.id
+    url = limpiar_url(m.text.strip())
+    conf = get_config(cid)
+    
+    wait_msg = await m.reply("🔎 **Analizando...**")
+    btns = []
+    html_links_data = []
+    
+    # Variables para control
+    yt_dlp_error = None
+    info = {}
 
-    # ================================
-    # 🔥 NORMALIZACIÓN MASIVA 2025 (190+ sitios)
-    # ================================
-
-    # ---- REDES SOCIALES & GENERALES ----
-    if any(dom in url for dom in [
-        "tiktok.com", "vm.tiktok.com", "vt.tiktok.com",
-        "instagram.com", "threads.net",
-        "facebook.com", "fb.com", "fb.watch",
-        "x.com", "twitter.com",
-        "youtube.com", "youtu.be",
-        "onlyfans.com", "fansly.com", "fantrie.com", "patreon.com", "thotshub.tv",
-        "reddit.com", "v.redd.it", "redditmedia.com",
-        "pinterest.com", "pin.it",
-        "discord.com", "discord.gg", "discordapp.com",
-        "twitch.tv", "kick.com", "rumble.com", "vimeo.com"
-    ]):
-        # Limpia parámetros para redes sociales
-        url = url.split("?")[0].split("&")[0]
-
-    # Facebook/fb.watch → resolución real (si tienes la función)
-    if any(dom in url for dom in ["facebook.com", "fb.com", "fb.watch"]):
+    # 1. MODO PLAYWRIGHT SNIFFER
+    if conf['html_mode']:
+        await wait_msg.edit("🕵️ **Buscando enlaces ocultos (HTML5)...**")
         try:
-            url = await asyncio.get_running_loop().run_in_executor(None, lambda: resolver_url_redirect(url))
-        except:
-            pass
+            html_links_data = await detectar_video_real(url)
+        except Exception as e:
+            print(f"Error Sniffer: {e}")
+        
+        if html_links_data:
+            for i, data in enumerate(html_links_data):
+                size_str = format_bytes(data['size'])
+                res_str = data['res']
+                icon = "📺" if "m3u8" in data['url'] else "📥"
+                # Botón con info
+                btns.append([InlineKeyboardButton(f"{icon} {res_str} • {size_str}", callback_data=f"dl|html_{i}")])
 
-    # X.com → twitter.com (compatibilidad)
-    if "x.com" in url:
-        url = url.replace("x.com", "twitter.com")
-
-    # ---- JAV & ASIÁTICO PURO (los más usados 2025) ----
-    if any(dom in url for dom in [
-        "missav.com", "missav123.com", "missav.vn",
-        "supjav.com", "vjav.com", "jav.guru", "javmost.com",
-        "jav.gg", "javgg.net", "javfinder.sh", "javfinder.is",
-        "javdb.com", "javbus.com", "javlibrary.com",
-        "javtasty.com", "javwhores.com", "bestjavporn.com",
-        "91porn.com", "91porny.com", "tokyomotion.net",
-        "7mmtv.tv", "7mmtv.sx", "thisav.com", "avple.tv",
-        "fc2hub.com", "fc2.com", "dmm.co.jp", "watchjavonline.com",
-        "njav.tv", "javdoe.sh", "zerojav.com", "vivamaxph.com"
-    ]):
-        url = url.split("?")[0]
-
-    # ---- TUBOS PORNO GENERALES + HISPANOS + LEAKS ----
-    if any(dom in url for dom in [
-        "pornhub.com", "pornhubpremium.com", "phncdn.com",
-        "xvideos.com", "xvideos-cdn.com", "xnxx.com", "xnxx-cdn.com",
-        "xhamster.com", "xhamster.desi", "xhamster2.com", "xhamster3.com",
-        "eporner.com", "spankbang.com", "redtube.com", "youporn.com",
-        "youjizz.com", "tube8.com", "beeg.com", "porntrex.com",
-        "daftsex.com", "motherless.com", "hclips.com", "thumbzilla.com",
-        "serviporno.com", "cerdas.com", "muyzorras.com", "petardashd.com",
-        "canalporno.com", "felizporno.com", "vsex.in", "porn.es",
-        "hqpomer.com", "yourporn.sexy", "3movs.com", "txxx.com",
-        "ok.xxx", "porn300.com", "analdin.com", "siska.tv",
-        "upornia.com", "fapnado.com", "porntop.com", "pornxp.com",
-        "watchxxxfree.com", "hdporn92.com", "4kporn.xxx", "theporndude.com"
-    ]):
-        url = url.split("?")[0]
-
-    # ================================
-    # ¡¡TU CÓDIGO SIGUE AQUÍ!!
-    # ================================
-    # Ahora 'url' está limpio y normalizado para todos los sitios
-    # await message.reply(f"Enlace limpio: {url}")
-    # ... descarga, análisis, etc.
-    url = limpiar_enlace_youtube(message.text.strip())
-    conf = get_config(chat_id)
-    
-    msg_status = await client.send_message(chat_id, "🔎 **Analizando...**")
-    
-    if "pin.it" in url or "t.co" in url: url = await resolver_url_redirect(url)
-
-    ydl_opts = {'quiet': True, 'no_warnings': True, 'ignoreerrors': True, 'noplaylist': True}
-    if os.path.exists(COOKIES_FILE): ydl_opts['cookiefile'] = COOKIES_FILE
-
+    # 2. MODO YT-DLP
     try:
-        loop = asyncio.get_running_loop()
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = await loop.run_in_executor(None, lambda: ydl.extract_info(url, download=False))
+        opts = {'quiet':True, 'noplaylist':True, 'http_headers':{'User-Agent':'Mozilla/5.0'}}
+        if "eporner" in url: opts['nocheckcertificate']=True
         
-        if not info:
-            await safe_edit(msg_status, "❌ Enlace inválido.")
-            return
+        info = await asyncio.get_running_loop().run_in_executor(None, lambda: yt_dlp.YoutubeDL(opts).extract_info(url, download=False))
+        if 'entries' in info: info = info['entries'][0]
+        
+        formats = info.get('formats', [])
+        # Agrupar formatos por resolución exacta (WxH)
+        unique_formats = {}
+        
+        for f in formats:
+            w = f.get('width')
+            h = f.get('height')
+            if not h or not w: continue
+            
+            res_key = f"{w}x{h}"
+            sz = f.get('filesize') or f.get('filesize_approx') or 0
+            
+            # Nos quedamos con el formato de mayor peso para esa resolución (mejor bitrate)
+            if res_key not in unique_formats or sz > unique_formats[res_key]['size']:
+                unique_formats[res_key] = {'size': sz, 'h': h}
+        
+        # Ordenar por altura (height) de mayor a menor
+        sorted_fmts = sorted(unique_formats.items(), key=lambda x: x[1]['h'], reverse=True)
 
-        url_storage[chat_id] = {
-            'url': url, 'titulo': info.get('title', 'Media'),
-            'descripcion': info.get('description', ''),
-            'tags': info.get('tags', []), 'categories': info.get('categories', []),
-            'genre': info.get('genre'), 'uploader': info.get('uploader')
-        }
-        datos = url_storage[chat_id]
+        # Crear botones con Dimensiones Reales (Feature pedida)
+        for res_key, data in sorted_fmts[:8]:
+            sz_str = format_bytes(data['size'])
+            icon = "🌟" if data['h'] >= 1080 else "📹"
+            # res_key ya es "1920x1080"
+            btns.append([InlineKeyboardButton(f"{icon} {res_key} • {sz_str}", callback_data=f"dl|{data['h']}")])
 
-        if conf['fmt'] == 'mp3':
-            await procesar_descarga_video(client, chat_id, url, "mp3", datos, msg_status)
-            return
-        if conf['q_fixed']:
-            await procesar_descarga_video(client, chat_id, url, conf['q_fixed'], datos, msg_status)
-            return
-        if conf['q_auto']:
-            q = 'best' if conf['q_auto'] == 'max' else 'worst'
-            await procesar_descarga_video(client, chat_id, url, q, datos, msg_status)
-            return
-
-        formatos = info.get('formats', [])
-        res_map = {}
-        for f in formatos:
-            if f.get('vcodec') != 'none' and f.get('height'):
-                h = f['height']
-                size = f.get('filesize') or f.get('filesize_approx') or 0
-                if h not in res_map or size > res_map[h]: res_map[h] = size
-        
-        sorted_res = sorted(res_map.keys(), reverse=True)
-        botones = []
-        
-        if not sorted_res:
-            botones.append([InlineKeyboardButton("⬇️ Descargar", callback_data="dl|best")])
-        else:
-            for res in sorted_res[:6]:
-                peso_str = format_bytes(res_map[res])
-                botones.append([InlineKeyboardButton(f"🎥 {res}p{peso_str}", callback_data=f"dl|{res}")])
-        
-        botones.append([InlineKeyboardButton("❌ Cancelar", callback_data="cancel")])
-        
-        await msg_status.delete()
-        tit = info.get('title', 'Video')[:50]
-        await client.send_message(chat_id, f"🎬 **{tit}**\n👇 Selecciona calidad:", reply_markup=InlineKeyboardMarkup(botones))
+        btns.append([InlineKeyboardButton("🎵 MP3 Audio", callback_data="dl|mp3")])
 
     except Exception as e:
-        print(f"Error Analyzer: {e}")
-        await clean_and_send(client, chat_id, "❌ Error al procesar.", msg_status)
+        yt_dlp_error = str(e)
+        print(f"YT-DLP Error: {e}")
+
+    btns.append([InlineKeyboardButton("❌ Cancelar", callback_data="cancel")])
+    
+    # Guardar datos
+    url_storage[cid] = {
+        'url': url, 
+        'id': info.get('id') if info else None, 
+        'titulo': info.get('title', 'Video Detectado'),
+        'tags': info.get('tags', []),
+        'html_links_data': html_links_data 
+    }
+
+    if not html_links_data and not info:
+        await wait_msg.edit(f"❌ No se encontraron videos.\nError YT-DLP: {str(yt_dlp_error)[:50]}...")
+        return
+
+    await wait_msg.delete()
+    tit = str(info.get('title', 'Resultado Multimedia'))[:50]
+    
+    texto_msg = f"🎬 **{tit}**"
+    if html_links_data:
+        texto_msg += "\n\n🕵️ **Enlaces Directos (Anti-Bloqueo):**"
+        # Mostramos los primeros 2 enlaces directos para que el usuario pueda usarlos si falla el bot
+        for d in html_links_data[:2]:
+            texto_msg += f"\n🔗 [Enlace Directo]({d['url']})"
+            
+    texto_msg += "\n👇 **Selecciona Calidad:**"
+    
+    await m.reply(texto_msg, reply_markup=InlineKeyboardMarkup(btns), disable_web_page_preview=True)
 
 if __name__ == "__main__":
     app.run()
