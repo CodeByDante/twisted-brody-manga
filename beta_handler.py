@@ -4,77 +4,69 @@ from database import url_storage
 from sniffer import detectar_video_real
 
 # // -----------------------------------------------------------
-# // MANEJADOR DEL BOTÓN "INVESTIGACIÓN HTML" (BETA)
+# // MANEJADOR: INVESTIGACIÓN HTML -> LINKS DIRECTOS
 # // -----------------------------------------------------------
 async def iniciar_escaneo_html(client, callback_query):
     msg = callback_query.message
     cid = msg.chat.id
     
-    # 1. Verificar si el enlace sigue en memoria
     d_storage = url_storage.get(cid)
     if not d_storage:
-        return await callback_query.answer("⚠️ La sesión expiró. Envía el enlace de nuevo.", show_alert=True)
+        return await callback_query.answer("⚠️ La sesión expiró.", show_alert=True)
 
     url_target = d_storage['url']
     
-    # 2. Avisar al usuario que el proceso inició
-    await callback_query.answer("🚀 Iniciando Navegador Espía... (20s aprox)")
+    await callback_query.answer("🚀 Iniciando Navegador JAV...")
     await msg.edit_text(
-        f"🕵️ **Ejecutando Investigación HTML (Beta)...**\n"
-        f"🔗 Analizando: `{url_target}`\n\n"
-        f"📸 _El bot tomará capturas y probará clics automáticos..._\n"
-        f"⏳ **Por favor espere...**"
+        f"🕵️ **Analizando sitio web...**\n"
+        f"🔗 URL: `{url_target}`\n\n"
+        f"🍪 Cookies: {'Sí' if 'jav' in url_target else 'No detectadas'}\n"
+        f"⏳ _Esperando streams (10-15s)..._"
     )
     
     try:
-        # 3. Ejecutar el Sniffer (sniffer.py)
-        # Le pasamos 'client' y 'cid' para que pueda enviar las fotos de debug
-        html_links_data = await detectar_video_real(url_target, client, cid)
+        # Ejecutar Sniffer
+        links_encontrados = await detectar_video_real(url_target, client, cid)
         
-        # 4. Actualizar la base de datos temporal con los nuevos resultados
-        d_storage['html_links_data'] = html_links_data
+        # Crear teclado de enlaces directos
+        botones_links = []
+        reporte_texto = ""
         
-        # 5. Construir los nuevos botones
-        # Recuperamos los botones originales de YT-DLP (si había)
-        old_markup = d_storage.get('original_markup', [])
-        new_btns = []
-        reporte_extra = ""
-        
-        if html_links_data:
-            reporte_extra = "\n\n✅ **Resultados de Investigación HTML:**\n"
-            for i, res in enumerate(html_links_data):
-                btn_txt = res['res'] # Ya viene formateado (Ej: 1080x1920 (Stream)...)
-                icon = "📺" if "m3u8" in res['url'] else "📥"
+        if links_encontrados:
+            reporte_texto = "✅ **Enlaces Directos Encontrados:**\n_Usa IDM o 1DM para descargar_ 👇\n\n"
+            
+            # Limitamos a los 6 mejores enlaces para no saturar
+            for i, link in enumerate(links_encontrados[:6]):
+                calidad = link['quality']
+                tipo = link['type']
+                url_final = link['url']
                 
-                # Agregamos el botón al inicio de la lista
-                new_btns.append([InlineKeyboardButton(f"{icon} {btn_txt}", callback_data=f"dl|html_{i}")])
+                # Texto del botón
+                texto_btn = f"⬇️ Descargar {calidad} ({tipo})"
                 
-                # Agregamos texto al reporte
-                reporte_extra += f"🔹 {btn_txt}\n"
+                # Botón URL (Abre navegador externo)
+                botones_links.append([InlineKeyboardButton(texto_btn, url=url_final)])
+                
+                # Opcional: Poner link en texto si es m3u8 para copiar fácil
+                if 'm3u8' in url_final:
+                    reporte_texto += f"🔹 **{calidad}:** `{url_final}`\n"
+
         else:
-            reporte_extra = "\n\n⚠️ **El escaneo no encontró resultados nuevos.**"
+            reporte_texto = "❌ **No se capturaron enlaces de video.**\n_El sitio tiene protección fuerte o requiere captcha._"
 
-        # 6. Fusionar botones (Nuevos + Antiguos)
-        # Si old_markup es un objeto InlineKeyboardMarkup, sacamos su lista .inline_keyboard
-        lista_antigua = old_markup.inline_keyboard if hasattr(old_markup, 'inline_keyboard') else old_markup
-        if not isinstance(lista_antigua, list): lista_antigua = []
-        
-        final_keyboard = new_btns + lista_antigua
-        
-        # Asegurar botón cancelar
-        if not any("cancel" in b.callback_data for row in final_keyboard for b in row):
-            final_keyboard.append([InlineKeyboardButton("❌ Cancelar", callback_data="cancel")])
+        # Botón volver
+        botones_links.append([InlineKeyboardButton("🔙 Volver / Cancelar", callback_data="cancel")])
 
-        # 7. Mostrar resultado final
-        tit = d_storage.get('titulo', 'Video')
+        # Enviar resultado
+        tit = d_storage.get('titulo', 'Resultado')
         await msg.edit_text(
-            f"🎬 **{tit}** (Actualizado)\n{reporte_extra}\n👇 **Selecciona Calidad:**",
-            reply_markup=InlineKeyboardMarkup(final_keyboard)
+            f"🎬 **{tit}**\n\n{reporte_texto}",
+            reply_markup=InlineKeyboardMarkup(botones_links),
+            disable_web_page_preview=True
         )
 
     except Exception as e:
-        print(f"Error en Beta Handler: {e}")
         await msg.edit_text(
-            f"❌ **Error en el Módulo Beta:**\n`{str(e)}`", 
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Volver", callback_data="cancel")]])
+            f"❌ **Error Crítico:**\n`{str(e)}`", 
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cerrar", callback_data="cancel")]])
         )
