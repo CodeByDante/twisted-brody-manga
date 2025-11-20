@@ -9,18 +9,16 @@ from config import LIMIT_2GB, HAS_ARIA2, HAS_FFMPEG
 from database import get_config, downloads_db, guardar_db
 from utils import sel_cookie, traducir_texto, generar_barra, format_bytes
 
-# // Mantiene el estado "Enviando..." activo
+# // --- MANTENER ESTADO "ENVIANDO" ---
 async def mantener_accion(client, chat_id, action):
     while True:
         try:
             await client.send_chat_action(chat_id, action)
             await asyncio.sleep(4)
-        except asyncio.CancelledError:
-            break
-        except:
-            pass
+        except asyncio.CancelledError: break
+        except: pass
 
-# // Barra de progreso para YT-DLP
+# // --- BARRA DE PROGRESO YT-DLP ---
 class YTProgress:
     def __init__(self, msg, loop):
         self.msg = msg
@@ -43,26 +41,21 @@ class YTProgress:
                     f"📦 {format_bytes(downloaded)} / {format_bytes(total)}\n"
                     f"⚡ Vel: {speed} | ⏳ Resta: {eta}"
                 )
-                try:
-                    asyncio.run_coroutine_threadsafe(self.msg.edit(text), self.loop)
+                try: asyncio.run_coroutine_threadsafe(self.msg.edit(text), self.loop)
                 except: pass
 
-# // Progreso de subida a Telegram
+# // --- PROGRESO SUBIDA TELEGRAM ---
 async def progreso(cur, tot, msg, times, act):
     now = time.time()
     if (now - times[1]) > 4 or cur == tot:
         times[1] = now
         try:
             bar = generar_barra(cur, tot)
-            txt = (
-                f"☁️ **Subiendo a Telegram...**\n"
-                f"{bar}\n"
-                f"📦 {format_bytes(cur)} / {format_bytes(tot)}"
-            )
+            txt = f"☁️ **Subiendo a Telegram...**\n{bar}\n📦 {format_bytes(cur)} / {format_bytes(tot)}"
             await msg.edit_text(txt)
         except: pass
 
-# // Helpers
+# // --- HELPERS ---
 async def get_thumb(path, cid, ts):
     out = f"t_{cid}_{ts}.jpg"
     if HAS_FFMPEG:
@@ -87,9 +80,7 @@ async def get_audio_dur(path):
         return int(float(json.loads((await p.communicate())[0])['format']['duration']))
     except: return 0
 
-# // -------------------------------------------------------
-# // PROCESAMIENTO PRINCIPAL
-# // -------------------------------------------------------
+# // --- PROCESAMIENTO PRINCIPAL ---
 async def procesar_descarga(client, chat_id, url, calidad, datos, msg_orig):
     conf = get_config(chat_id)
     vid_id = datos.get('id')
@@ -101,17 +92,8 @@ async def procesar_descarga(client, chat_id, url, calidad, datos, msg_orig):
     url_descarga = url
     accion_tarea = None
 
-    # // --- LOGICA DE REPLY (RESPONDER AL USUARIO) ---
-    # // msg_orig es el mensaje del bot con botones.
-    # // msg_orig.reply_to_message es el mensaje del usuario con el link.
-    # // Guardamos ese ID para responderle siempre a ese mensaje.
-    id_usuario_link = None
-    if msg_orig.reply_to_message:
-        id_usuario_link = msg_orig.reply_to_message.id
-    else:
-        # Si por alguna razón no hay referencia, usamos el chat general
-        id_usuario_link = None
-    # // ----------------------------------------------
+    # Detectar Reply para mantener hilo
+    id_usuario_link = msg_orig.reply_to_message.id if msg_orig.reply_to_message else None
 
     if calidad.startswith("html_"):
         idx = int(calidad.split("_")[1])
@@ -122,12 +104,11 @@ async def procesar_descarga(client, chat_id, url, calidad, datos, msg_orig):
     else:
         ckey = "mp3" if calidad == "mp3" else calidad
     
-    # // Cache
+    # Cache Check
     if vid_id and vid_id in downloads_db and ckey in downloads_db[vid_id]:
         try:
             fid = downloads_db[vid_id][ckey]
             cap = f"🎬 **{datos.get('titulo','Video')}**\n✨ (Cache)"
-            # Respondemos al link original
             if calidad == "mp3": await client.send_audio(chat_id, fid, caption=cap, reply_to_message_id=id_usuario_link)
             else: await client.send_video(chat_id, fid, caption=cap, reply_to_message_id=id_usuario_link)
             return
@@ -137,10 +118,9 @@ async def procesar_descarga(client, chat_id, url, calidad, datos, msg_orig):
         tipo_accion = enums.ChatAction.UPLOAD_AUDIO if calidad == "mp3" else enums.ChatAction.UPLOAD_VIDEO
         accion_tarea = asyncio.create_task(mantener_accion(client, chat_id, tipo_accion))
 
-        # // Enviamos el mensaje de estado RESPONDIENDO al link original
         status = await client.send_message(
             chat_id, 
-            f"⏳ **Iniciando descarga...**\n📥 {calidad}",
+            f"⏳ **Descarga Automática...**\n📥 Calidad: {calidad}",
             reply_to_message_id=id_usuario_link
         )
         
@@ -152,17 +132,35 @@ async def procesar_descarga(client, chat_id, url, calidad, datos, msg_orig):
             'progress_hooks': [YTProgress(status, loop)] 
         }
 
+        # // --- SELECCIÓN DE FORMATO ---
         if calidad == "mp3":
             opts.update({'format': 'bestaudio/best', 'postprocessors': [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3'}]})
         elif calidad.startswith("html_"):
             opts['format'] = 'best'
+        
+        # CASO BEST (Mejor calidad posible)
+        elif calidad == 'best':
+            opts['format'] = 'bestvideo+bestaudio/best'
+            opts['merge_output_format'] = 'mp4'
+        
+        # CASO WORST (Peor calidad / Menos peso)
+        elif calidad == 'worst':
+            # Intentamos buscar el peor mp4, si no, el peor cualquiera
+            opts['format'] = 'worst[ext=mp4]/worst'
+            # No forzamos merge porque si es 3gp pequeño, ffmpeg puede fallar o aumentar peso
+        
+        # CASO ESPECIFICO (1080p, etc)
         else:
-            if calidad.isdigit() or "x" in calidad: 
+            if "x" in calidad: 
                  h = calidad.split('x')[-1]
                  opts['format'] = f"bv*[height<={h}]+ba/b[height<={h}] / best"
-            else: opts['format'] = 'best'
+            elif calidad.isdigit():
+                 opts['format'] = f"bv*[height<={calidad}]+ba/b[height<={calidad}] / best"
+            else: 
+                 opts['format'] = 'best'
             opts['merge_output_format'] = 'mp4'
 
+        # Cookies
         if "eporner" in url_descarga: opts.update({'external_downloader': None, 'nocheckcertificate': True})
         elif "pornhub" in url_descarga: opts.update({'cookiefile': 'cookies_pornhub.txt', 'nocheckcertificate': True})
         else:
@@ -174,24 +172,26 @@ async def procesar_descarga(client, chat_id, url, calidad, datos, msg_orig):
         with yt_dlp.YoutubeDL(opts) as ydl:
             await loop.run_in_executor(None, lambda: ydl.download([url_descarga]))
         
+        # // --- BÚSQUEDA DE ARCHIVO FINAL (FIX 3GP/FLV) ---
         base = f"dl_{chat_id}_{ts}"
         if calidad == "mp3": final = f"{base}.mp3"
         else:
-            for e in ['.mp4','.mkv','.webm']:
+            # Buscamos más extensiones porque 'worst' puede bajar 3gp o flv
+            for e in ['.mp4', '.mkv', '.webm', '.3gp', '.flv', '.mov']:
                 if os.path.exists(base+e): 
                     final = base+e
                     break
         
         if not final or not os.path.exists(final):
-            if status: await status.edit("❌ Error: Fallo descarga.")
+            if status: await status.edit("❌ Error: No se encontró el archivo descargado.")
             return
         
         if os.path.getsize(final) > LIMIT_2GB:
             os.remove(final)
-            if status: await status.edit("❌ Error: > 2GB.")
+            if status: await status.edit("❌ Error: Archivo > 2GB.")
             return
 
-        if status: await status.edit("📝 **Procesando metadatos...**")
+        if status: await status.edit("📝 **Metadatos...**")
         w, h, dur = 0, 0, 0
         if calidad != "mp3":
             thumb = await get_thumb(final, chat_id, ts)
@@ -208,7 +208,6 @@ async def procesar_descarga(client, chat_id, url, calidad, datos, msg_orig):
             cap = f"🎬 **{t}**\n⚙️ {res_str} | ⏱ {time.strftime('%H:%M:%S', time.gmtime(dur))}\n{' '.join(tags)}"[:1024]
 
         res = None
-        # // Al subir, especificamos reply_to_message_id para mantener el hilo
         if calidad == "mp3":
             res = await client.send_audio(
                 chat_id, final, caption=cap, duration=dur, thumb=thumb, 

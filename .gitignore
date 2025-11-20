@@ -3,3 +3,24 @@ __pycache__/
 *.session-journal
 cookies.txt
 *.pyc
+ffmpeg.exe
+ffprobe.exe
+*.exe
+# Evitar subir binarios pesados
+ffmpeg.exe
+ffprobe.exe
+*.mp4
+*.jpg
+*.png
+*.zip
+*.7z
+
+# Evitar archivos temporales
+*.tmp
+*.log
+__pycache__/
+*.pyc
+
+# Evitar descargas
+dl_*
+t_*
